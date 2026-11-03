@@ -842,7 +842,7 @@ const GITHUB_USER =
 
 const REPO_NAME =
 
-"MITU-Brazil-Catalog2";
+"MITU-Brazil-Catalog3";
 
 
 
@@ -851,6 +851,7 @@ const REPO_NAME =
 let allSKUs=[];
 
 let catalog={};
+let productMetadata={};
 
 
 
@@ -886,6 +887,11 @@ console.log("开始读取catalog");
 const response = await fetch("catalog.json");
 
 catalog = await response.json();
+// 手工维护的名称、分类及关键词可能保存在 products.json。
+try {
+  const metaResponse = await fetch("products.json", {cache:"no-store"});
+  if (metaResponse.ok) productMetadata = await metaResponse.json();
+} catch(e) { console.warn("products.json 暂时不可用", e); }
 
 console.log(catalog);
 allSKUs = Object.keys(catalog)
@@ -955,30 +961,39 @@ cover.png
 */
 
 
-function findCover(sku){
-  // 使用已经加载的 catalog.json，不再为每张卡片请求 GitHub API。
+function skuFiles(sku){
   const info = catalog[sku] || {};
-  const files = Array.isArray(info.files) ? info.files : [];
-  const imageFiles = files.filter(file => {
-    const name = typeof file === "string" ? file : (file.name || file.url || "");
-    return /\.(jpg|jpeg|png|webp)$/i.test(name.split("?")[0]);
-  });
-  const priority = ["1.jpg", "1.png", "1.jpeg", "1.webp"];
-  imageFiles.sort((a,b) => {
-    const an = (typeof a === "string" ? a : (a.name || "")).toLowerCase();
-    const bn = (typeof b === "string" ? b : (b.name || "")).toLowerCase();
-    const ai = priority.indexOf(an), bi = priority.indexOf(bn);
-    return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi);
-  });
-  if (imageFiles.length){
-    const file = imageFiles[0];
-    const raw = typeof file === "string" ? file : (file.url || file.name);
-    if (/^https?:\/\//i.test(raw)) return raw;
-    const normalized = raw.replace(/^\.\//, "").replace(/^\//, "");
-    return normalized.startsWith(sku + "/") ? normalized : `${sku}/${normalized}`;
-  }
-  // 兼容旧目录：没有图片索引时尝试 1.jpg。
-  return `${sku}/1.jpg`;
+  return Array.isArray(info.files) ? info.files : [];
+}
+function fileName(file){ return typeof file === "string" ? file : String(file.name || ""); }
+function fileUrl(sku,file){
+  const raw = typeof file === "string" ? file : String(file.url || file.name || "");
+  if (/^https?:\/\//i.test(raw)) return raw;
+  const clean = raw.replace(/^\.\//, "").replace(/^\//, "");
+  return clean.startsWith(sku + "/") ? clean : `${sku}/${clean}`;
+}
+function findCover(sku){
+  const files = skuFiles(sku);
+  const pictures = files.filter(f => /\.(jpg|jpeg|png|webp)$/i.test(fileName(f)));
+  const rank = n => /^(cover|1)\.(jpg|jpeg|png|webp)$/i.test(n) ? 0 : 1;
+  pictures.sort((a,b) => rank(fileName(a))-rank(fileName(b)));
+  return pictures.length ? fileUrl(sku,pictures[0]) : `${sku}/1.jpg`;
+}
+function applyCoverFallback(img,sku){
+  const candidates = [...new Set([findCover(sku),`${sku}/cover.jpg`,`${sku}/cover.png`,`${sku}/1.jpg`,`${sku}/1.png`,`${sku}/1.jpeg`,`${sku}/1.webp`,`default-cover.png`])];
+  let index = 0;
+  img.onerror = () => { index++; if(index < candidates.length) img.src = candidates[index]; else img.onerror = null; };
+  img.src = candidates[0];
+}
+function productInfo(sku){
+  const c = catalog[sku] || {};
+  const root = productMetadata || {};
+  const p = (root[sku] || (root.products && root.products[sku]) || (Array.isArray(root.products) ? root.products.find(x => String(x.sku || x.id) === sku) : null) || {});
+  return {
+    name: String(p.name || p.title || c.name || ""),
+    category: String(p.category || c.category || ""),
+    keywords: [...(Array.isArray(c.keywords)?c.keywords:[]), ...(Array.isArray(p.keywords)?p.keywords:typeof p.keywords === "string"?p.keywords.split(/[,，;；]/):[])]
+  };
 }
 /*
 ===============================
@@ -998,18 +1013,7 @@ function renderSKUList(skus){
     const card = document.createElement("div");
     card.className = "sku-card";
     const img = document.createElement("img");
-    img.src = findCover(sku);
-    img.alt = `SKU ${sku}`;
-    img.loading = "lazy";
-    img.onerror = function(){
-      // 如果 catalog 没有图片清单，兼容 1.png 等常见封面。
-      const attempts = [`${sku}/1.jpg`, `${sku}/1.png`, `${sku}/1.jpeg`, `${sku}/1.webp`, "default-cover.png"];
-      const current = this.getAttribute("src") || "";
-      const index = attempts.indexOf(current);
-      const next = index < 0 ? attempts[0] : attempts[index + 1];
-      this.onerror = next === "default-cover.png" ? null : this.onerror;
-      if (next) this.src = next;
-    };
+    applyCoverFallback(img,sku);
     const info = document.createElement("div");
     info.className = "sku-info";
     info.textContent = `SKU: ${sku}`;
@@ -1142,20 +1146,20 @@ document.getElementById(id)
 
 
 
-const files =
-
-await fetch(
-
-`https://api.github.com/repos/${GITHUB_USER}/${REPO_NAME}/contents/${sku}`
-
-)
-
-.then(r=>r.json());
-
-
-
-
-
+// 直接使用已部署的目录索引，不依赖 GitHub API 授权或仓库名称。
+let files = skuFiles(sku).map(f => ({
+  name:fileName(f),
+  download_url:fileUrl(sku,f)
+}));
+// 若索引缺少文件，再尝试测试仓库的 GitHub API。
+if (!files.length) {
+  try {
+    const r = await fetch(`https://api.github.com/repos/${GITHUB_USER}/${REPO_NAME}/contents/${sku}`);
+    if(r.ok) { const data = await r.json(); if(Array.isArray(data)) files = data; }
+  } catch(e) { console.warn("读取文件列表失败",e); }
+}
+// 即使索引未列出参数页，也优先尝试本地参数页。
+const specCandidate = `${sku}/product-spec.html`;
 let archives="";
 
 let images="";
@@ -1260,7 +1264,7 @@ name.toLowerCase()==="product-spec.html"
 
 console.log("找到参数文件", file.download_url);
 
-spec=`${window.location.origin}/${sku}/${name}`;
+spec=file.download_url || specCandidate;
 
 }
 
@@ -1303,9 +1307,9 @@ document.getElementById("videoSection").style.display="block";
 
 // 输出参数
 
-if(spec){
+if(spec || specCandidate){
 
-document.getElementById("specFrame").src=spec;
+document.getElementById("specFrame").src=spec || specCandidate;
 
 document.getElementById("specSection").style.display="block";
 
@@ -1393,10 +1397,10 @@ function filterSKUs(){
     return;
   }
   const result = allSKUs.filter(sku => {
-    const info = catalog[sku] || {};
-    const name = String(info.name || "").toLowerCase();
-    const category = String(info.category || "").toLowerCase();
-    const keywords = Array.isArray(info.keywords) ? info.keywords : [];
+    const info = productInfo(sku);
+    const name = info.name.toLowerCase();
+    const category = info.category.toLowerCase();
+    const keywords = info.keywords;
     return sku.toLowerCase().includes(keyword)
       || name.includes(keyword)
       || category.includes(keyword)
